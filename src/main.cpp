@@ -3,15 +3,16 @@
 #include <IPAddress.h>
 #include <esp_camera.h>
 #include <cmath>
+#include <ESP32Ticker.h>
 #include <ros.h>
 #include <geometry_msgs/Twist.h>
 #include <sensor_msgs/Image.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
+#include <std_msgs/Float32.h>
 
 // Include correct camera pins
 #define CAMERA_MODEL_AI_THINKER
-
 #include "camera_pins.h"
 
 // PINS
@@ -27,18 +28,27 @@
 #define PWM_CHANNEL_SERVO 2
 
 // MIN and MAX values for PWM
+#define PWM_FREQUENCY 50
+#define PWM_RESOLUTION 16
 #define PWM_MOTOR_MIN 0
-#define PWM_MOTOR_MAX 255
-#define PWM_SERVO_MIN 9
-#define PWM_SERVO_MAX 30
-
-// If there are no new CMD_VEL message during this interval, the robot stops
-//#define MAX_CMD_VEL_INTERVAL 1000
+#define PWM_MOTOR_MAX 65535
+#define PWM_SERVO_MIN 2304  // These values are determined by experiment and may differ on your system
+#define PWM_SERVO_MAX 7680
 
 
-// Define your own credentials via platformio.ini
-const char *ssid = "SSID";
-const char *password = "PASSWORD";
+// You can also define your wifi access via platformio.ini or environment variables
+// https://docs.platformio.org/en/latest/projectconf/section_env_build.html#build-flags
+// https://docs.platformio.org/en/latest/envvars.html#envvar-PLATFORMIO_BUILD_FLAGS
+// If you do, be sure to escape the quotes (\"), e.g.: -D WIFI_SSID=\"YOUR_SSID\"
+#ifndef WIFI_SSID
+  #define WIFI_SSID "YOUR_SSID"
+#endif
+#ifndef WIFI_PASS
+  #define WIFI_PASS "YOUR_PASSWORD"
+#endif
+
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASS;
 
 
 // ROS
@@ -46,8 +56,10 @@ IPAddress serialServer(192, 168, 0, 12);
 ros::NodeHandle *node;
 ros::Subscriber<geometry_msgs::Twist> *cmdvelSub;
 ros::Subscriber<std_msgs::Bool> *flashSub;
+ros::Publisher *fpsPub;
 ros::Publisher *idPub;
 ros::Publisher *streamPub;
+std_msgs::Float32 *fpsMsg;
 std_msgs::String *info;
 sensor_msgs::Image *stream;
 
@@ -56,16 +68,31 @@ char id[19];
 char cmdvelTopic[19 + 8]; // id + /cmd_vel
 char streamTopic[19 + 7]; // id + /stream
 char flashTopic[19 + 6];  // id + /flash
+char fpsTopic[19 + 4];  // id + /fps
 
 bool connected = false;
 bool movement = false;
 float linear, angular = 0;
-uint64_t lastCmdVelMessage = 0;
+
+// Timing
+#define AVERAGE_ALPHA 0.7f
+float frameDuration = 0;
+unsigned long lastFrameTime = 0;
+unsigned long lastCmdVelMessage = 0;
+
+// Tickers
+//#define MAX_CMD_VEL_INTERVAL 1000 // If there are no new CMD_VEL message during this interval, the robot stops
+#define FPS_PUBLISH_TIME 1          // in seconds
+#define LOOP_TIME 0.01              // Loop runs way too fast on ESP32. Running the loop every 10 ms is enough
+Ticker *fpsTicker;
+Ticker *loopTicker;
 
 // Function definitions
 void onCmdVel(const geometry_msgs::Twist &msg);
 void onFlash(const std_msgs::Bool &msg);
 void stop();
+void publishFps();
+void _loop();
 float fmap(float val, float in_min, float in_max, float out_min, float out_max);
 
 
@@ -82,9 +109,9 @@ void setupPins() {
   digitalWrite(LED_FLASH, LOW);
 
   // Forward and backward PWM channels
-  ledcSetup(PWM_CHANNEL_FORWARD, 50, 8);
-  ledcSetup(PWM_CHANNEL_BACKWARD, 50, 8);
-  ledcSetup(PWM_CHANNEL_SERVO, 50, 8);
+  ledcSetup(PWM_CHANNEL_FORWARD, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(PWM_CHANNEL_BACKWARD, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(PWM_CHANNEL_SERVO, PWM_FREQUENCY, PWM_RESOLUTION);
 
   ledcAttachPin(PIN_FORWARD, PWM_CHANNEL_FORWARD);
   ledcAttachPin(PIN_BACKWARD, PWM_CHANNEL_BACKWARD);
@@ -110,6 +137,10 @@ void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
+  // Debug
+//  Serial.println(ssid);
+//  Serial.println(password);
+
   Serial.println("Connecting to Wifi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -121,6 +152,17 @@ void setupWifi() {
   Serial.println(WiFi.SSID());
   Serial.print("IP:   http://");
   Serial.println(WiFi.localIP());
+}
+
+void setupTopics() {
+  uint64_t mac = ESP.getEfuseMac(); //The chip ID is essentially its MAC address(length: 6 bytes).
+  snprintf(id, 19, "ESP32_%04X%08X", (uint16_t) (mac >> 32u), (uint32_t) mac);
+  snprintf(cmdvelTopic, 19 + 8, "%s/cmd_vel", id);
+  snprintf(streamTopic, 19 + 7, "%s/stream", id);
+  snprintf(flashTopic, 19 + 6, "%s/flash", id);
+  snprintf(fpsTopic, 19 + 4, "%s/fps", id);
+  Serial.print("ID:   ");
+  Serial.println(id);
 }
 
 void setupRos() {
@@ -138,10 +180,14 @@ void setupRos() {
   flashSub = new ros::Subscriber<std_msgs::Bool>(flashTopic, &onFlash);
   node->subscribe(*flashSub);
 
+  fpsMsg = new std_msgs::Float32();
+  fpsPub = new ros::Publisher(fpsTopic, fpsMsg);
+  node->advertise(*fpsPub);
+
 //  info = new std_msgs::String();
 //  idPub = new ros::Publisher(id, info);
 //  node->advertise(*idPub);
-//
+
 //  stream = new sensor_msgs::Image();
 //  streamPub = new ros::Publisher(streamTopic, stream);
 //  node->advertise(*streamPub);
@@ -203,14 +249,12 @@ void setupCamera() {
   s->set_framesize(s, FRAMESIZE_QVGA);
 }
 
-void getROSTopics() {
-  uint64_t mac = ESP.getEfuseMac(); //The chip ID is essentially its MAC address(length: 6 bytes).
-  snprintf(id, 19, "ESP32_%04X%08X", (uint16_t) (mac >> 32u), (uint32_t) mac);
-  snprintf(cmdvelTopic, 19 + 8, "%s/cmd_vel", id);
-  snprintf(streamTopic, 19 + 7, "%s/stream", id);
-  snprintf(flashTopic, 19 + 6, "%s/flash", id);
-  Serial.print("ID:   ");
-  Serial.println(id);
+void setupTickers() {
+  fpsTicker = new Ticker();
+  fpsTicker->attach(FPS_PUBLISH_TIME, publishFps);
+
+  loopTicker = new Ticker();
+  loopTicker->attach(LOOP_TIME, _loop);
 }
 
 // ROS callbacks
@@ -232,9 +276,8 @@ void onCmdVel(const geometry_msgs::Twist &msg) {
 }
 
 
-// Loop functions
+// Loop functions (run every frame)
 // -------------------------------------------------------------------
-
 
 bool rosConnected() {
   // If value changes, notify via LED and console.
@@ -269,15 +312,37 @@ void handleMovement() {
   if (!movement)
     return;
 
-  auto pwmMotor = (uint8_t) fmap(std::fabs(linear), 0, 1, PWM_MOTOR_MIN, PWM_MOTOR_MAX);
-  auto pwmServo = (uint8_t) fmap(angular, -1, 1, PWM_SERVO_MIN, PWM_SERVO_MAX);
+  auto pwmMotor = (uint16_t) fmap(std::fabs(linear), 0, 1, PWM_MOTOR_MIN, PWM_MOTOR_MAX);
+  auto pwmServo = (uint16_t) fmap(angular, -1, 1, PWM_SERVO_MIN, PWM_SERVO_MAX);
 
   ledcWrite(PWM_CHANNEL_FORWARD, pwmMotor * (linear > 0));
   ledcWrite(PWM_CHANNEL_BACKWARD, pwmMotor * (linear < 0));
   ledcWrite(PWM_CHANNEL_SERVO, pwmServo);
-  Serial.printf("%f, %f, %d, %d\n", linear, angular, pwmMotor, pwmServo);
+//  Serial.printf("%f, %f, %d, %d\n", linear, angular, pwmMotor, pwmServo);
 
   movement = false;
+}
+
+void measureFramerate() {
+  auto now = millis();
+  auto duration = now - lastFrameTime;
+  lastFrameTime = now;
+
+  // Calculate Exponential moving average of frame time
+  // https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average
+  frameDuration = duration * AVERAGE_ALPHA + (frameDuration * (1 - AVERAGE_ALPHA));
+
+//  Serial.printf("%lu, %lu, %lu, %f\n", now, lastFrameTime, duration, frameDuration);
+}
+
+// Ticker functions (run every X seconds)
+// -------------------------------------------------------------------
+
+void publishFps() {
+  if (frameDuration > 0) {
+    fpsMsg->data = 1000.0f / frameDuration;
+    fpsPub->publish(fpsMsg);
+  }
 }
 
 
@@ -289,16 +354,21 @@ void setup() {
   setupSerial();
   setupWifi();
 //  setupCamera();
-  getROSTopics();
+  setupTopics();
   setupRos();
 //  startCameraServer();
+  setupTickers();
 }
 
-void loop() {
-  rosConnected();
+// Note: regular loop function gets called way too fast, so we run our own loop here
+void _loop() {
+  measureFramerate();
   node->spinOnce();
+  rosConnected();
   handleMovement();
 }
+
+void loop() { }
 
 // Helper functions
 // -------------------------------------------------------------------

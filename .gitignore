@@ -1,9 +1,11 @@
 cmake-build-esp32cam
 cmake-build-debug
+CMakeListsPrivate.txt
+CMakeLists.txt
 .idea
+.pio
 .pioenvs
 .piolibdeps
 .clang_complete
 .gcc-flags.json
-.pio
 .travis.yml
