@@ -18,8 +18,8 @@
 // PINS
 #define LED_BUILTIN 33
 #define LED_FLASH 4
-#define PIN_FORWARD 2
-#define PIN_BACKWARD 14
+#define PIN_FORWARD 12
+#define PIN_BACKWARD 13
 #define PIN_SERVO 15
 
 // PWM Channels
@@ -30,10 +30,12 @@
 // MIN and MAX values for PWM
 #define PWM_FREQUENCY 50
 #define PWM_RESOLUTION 16
-#define PWM_MOTOR_MIN 0
-#define PWM_MOTOR_MAX 65535
-#define PWM_SERVO_MIN 2304  // These values are determined by experiment and may differ on your system
-#define PWM_SERVO_MAX 7680
+
+// These values are determined by experiment and may differ on your system
+#define PWM_MOTOR_MIN 5000  // The value where the motor starts moving
+#define PWM_MOTOR_MAX 65535 // Full on
+#define PWM_SERVO_MIN 2304  // -90°
+#define PWM_SERVO_MAX 7680  // +90°
 
 
 // You can also define your wifi access via platformio.ini or environment variables
