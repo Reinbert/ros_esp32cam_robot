@@ -32,10 +32,13 @@
 #define PWM_RESOLUTION 16
 
 // These values are determined by experiment and may differ on your system
-#define PWM_MOTOR_MIN 5000  // The value where the motor starts moving
-#define PWM_MOTOR_MAX 65535 // Full on
-#define PWM_SERVO_MIN 2304  // -90°
-#define PWM_SERVO_MAX 7680  // +90°
+#define PWM_MOTOR_MIN 5000    // The value where the motor starts moving
+#define PWM_MOTOR_MAX 65535   // Full on
+#define PWM_SERVO_LEFT 2100   // 90° left
+#define PWM_SERVO_RIGHT 7800  // 90° right
+
+// Debugging defines
+#define ENABLE_CAMERA
 
 
 // You can also define your wifi access via platformio.ini or environment variables
@@ -54,23 +57,24 @@ const char *password = WIFI_PASS;
 
 
 // ROS
-IPAddress serialServer(192, 168, 0, 12);
+IPAddress serialServer(10, 0, 1, 10);
 ros::NodeHandle *node;
 ros::Subscriber<geometry_msgs::Twist> *cmdvelSub;
 ros::Subscriber<std_msgs::Bool> *flashSub;
 ros::Publisher *fpsPub;
-ros::Publisher *idPub;
+ros::Publisher *logPub;
 ros::Publisher *streamPub;
 std_msgs::Float32 *fpsMsg;
-std_msgs::String *info;
+std_msgs::String *logMsg;
 sensor_msgs::Image *stream;
 
 // ROS topics
-char id[19];
-char cmdvelTopic[19 + 8]; // id + /cmd_vel
-char streamTopic[19 + 7]; // id + /stream
-char flashTopic[19 + 6];  // id + /flash
-char fpsTopic[19 + 4];  // id + /fps
+char id[64];
+char cmdvelTopic[64]; // id + /cmd_vel
+char streamTopic[64]; // id + /stream
+char flashTopic[64];  // id + /flash
+char fpsTopic[64];    // id + /fps
+char logTopic[64];    // id + /log
 
 bool connected = false;
 bool movement = false;
@@ -90,10 +94,12 @@ Ticker *fpsTicker;
 Ticker *loopTicker;
 
 // Function definitions
+void startCameraServer();
 void onCmdVel(const geometry_msgs::Twist &msg);
 void onFlash(const std_msgs::Bool &msg);
 void stop();
 void publishFps();
+void publishLog(const char *format, ...);
 void _loop();
 float fmap(float val, float in_min, float in_max, float out_min, float out_max);
 
@@ -121,7 +127,7 @@ void setupPins() {
 
   ledcWrite(PWM_CHANNEL_FORWARD, 0);
   ledcWrite(PWM_CHANNEL_BACKWARD, 0);
-  ledcWrite(PWM_CHANNEL_SERVO, (PWM_SERVO_MIN + PWM_SERVO_MAX) / 2);
+  ledcWrite(PWM_CHANNEL_SERVO, (PWM_SERVO_RIGHT + PWM_SERVO_LEFT) / 2);
 }
 
 void setupSerial() {
@@ -158,11 +164,13 @@ void setupWifi() {
 
 void setupTopics() {
   uint64_t mac = ESP.getEfuseMac(); //The chip ID is essentially its MAC address(length: 6 bytes).
-  snprintf(id, 19, "ESP32_%04X%08X", (uint16_t) (mac >> 32u), (uint32_t) mac);
-  snprintf(cmdvelTopic, 19 + 8, "%s/cmd_vel", id);
-  snprintf(streamTopic, 19 + 7, "%s/stream", id);
-  snprintf(flashTopic, 19 + 6, "%s/flash", id);
-  snprintf(fpsTopic, 19 + 4, "%s/fps", id);
+  snprintf(id, 64, "ESP32_%04X%08X", (uint16_t) (mac >> 32u), (uint32_t) mac);
+//  snprintf(cmdvelTopic, 64, "/cmd_vel");
+  snprintf(cmdvelTopic, 64, "%s/cmd_vel", id);
+  snprintf(flashTopic, 64, "%s/flash", id);
+  snprintf(fpsTopic, 64, "%s/fps", id);
+  snprintf(logTopic, 64, "%s/log", id);
+  snprintf(streamTopic, 64, "%s/stream", id);
   Serial.print("ID:   ");
   Serial.println(id);
 }
@@ -176,19 +184,21 @@ void setupRos() {
   node->getHardware()->setConnection(serialServer);
   node->initNode();
 
+  // Subscribers
   cmdvelSub = new ros::Subscriber<geometry_msgs::Twist>(cmdvelTopic, &onCmdVel);
   node->subscribe(*cmdvelSub);
 
   flashSub = new ros::Subscriber<std_msgs::Bool>(flashTopic, &onFlash);
   node->subscribe(*flashSub);
 
+  // Publishers
   fpsMsg = new std_msgs::Float32();
   fpsPub = new ros::Publisher(fpsTopic, fpsMsg);
   node->advertise(*fpsPub);
 
-//  info = new std_msgs::String();
-//  idPub = new ros::Publisher(id, info);
-//  node->advertise(*idPub);
+  logMsg = new std_msgs::String();
+  logPub = new ros::Publisher(logTopic, logMsg);
+  node->advertise(*logPub);
 
 //  stream = new sensor_msgs::Image();
 //  streamPub = new ros::Publisher(streamTopic, stream);
@@ -196,6 +206,8 @@ void setupRos() {
 }
 
 void setupCamera() {
+
+#ifdef ENABLE_CAMERA
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -249,6 +261,8 @@ void setupCamera() {
   }
   //drop down frame size for higher initial frame rate
   s->set_framesize(s, FRAMESIZE_QVGA);
+
+#endif
 }
 
 void setupTickers() {
@@ -264,7 +278,7 @@ void setupTickers() {
 
 void onFlash(const std_msgs::Bool &msg) {
   digitalWrite(LED_FLASH, msg.data); // false -> off, true -> on
-  Serial.printf("Flash: %s\n", msg.data ? "ON" : "OFF");
+  publishLog("Flash: %s", msg.data ? "ON" : "OFF");
 }
 
 // Receive messages and store them. They are handled once per frame in main loop.
@@ -290,7 +304,7 @@ bool rosConnected() {
       stop();
 
     digitalWrite(LED_BUILTIN, !connected); // false -> on, true -> off
-    Serial.println(connected ? "ROS connected" : "ROS disconnected");
+    publishLog(connected ? "ROS connected" : "ROS disconnected");
   }
   return connected;
 }
@@ -315,13 +329,19 @@ void handleMovement() {
     return;
 
   auto pwmMotor = (uint16_t) fmap(std::fabs(linear), 0, 1, PWM_MOTOR_MIN, PWM_MOTOR_MAX);
-  auto pwmServo = (uint16_t) fmap(angular, -1, 1, PWM_SERVO_MIN, PWM_SERVO_MAX);
+  auto pwmServo = (uint16_t) fmap(angular, -1, 1, PWM_SERVO_RIGHT, PWM_SERVO_LEFT);
+  bool forward = linear > 0;
+  bool backward = linear < 0;
 
-  ledcWrite(PWM_CHANNEL_FORWARD, pwmMotor * (linear > 0));
-  ledcWrite(PWM_CHANNEL_BACKWARD, pwmMotor * (linear < 0));
-  ledcWrite(PWM_CHANNEL_SERVO, pwmServo);
-//  Serial.printf("%f, %f, %d, %d\n", linear, angular, pwmMotor, pwmServo);
+  ledcWrite(PWM_CHANNEL_FORWARD, pwmMotor * forward);
+  ledcWrite(PWM_CHANNEL_BACKWARD, pwmMotor * backward);
 
+  // Don't allow steering while there's no movement because the robot can't handle it well.
+  if (forward || backward) {
+    ledcWrite(PWM_CHANNEL_SERVO, pwmServo);
+  }
+
+  publishLog("%d, %d, %d, %d", pwmMotor, pwmServo, forward, backward);
   movement = false;
 }
 
@@ -333,11 +353,9 @@ void measureFramerate() {
   // Calculate Exponential moving average of frame time
   // https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average
   frameDuration = duration * AVERAGE_ALPHA + (frameDuration * (1 - AVERAGE_ALPHA));
-
-//  Serial.printf("%lu, %lu, %lu, %f\n", now, lastFrameTime, duration, frameDuration);
 }
 
-// Ticker functions (run every X seconds)
+// Publish functions
 // -------------------------------------------------------------------
 
 void publishFps() {
@@ -347,6 +365,16 @@ void publishFps() {
   }
 }
 
+void publishLog(const char *format, ...) {
+  char buffer[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, 256, format, args);
+  va_end(args);
+  logMsg->data = buffer;
+  logPub->publish(logMsg);
+  Serial.printf("%s\n", buffer);
+}
 
 // Main functions
 // -------------------------------------------------------------------
@@ -355,10 +383,13 @@ void setup() {
   setupPins();
   setupSerial();
   setupWifi();
-//  setupCamera();
+  setupCamera();
   setupTopics();
   setupRos();
-//  startCameraServer();
+
+#ifdef ENABLE_CAMERA
+  startCameraServer();
+#endif
   setupTickers();
 }
 
@@ -382,6 +413,3 @@ float fmap(float val, float in_min, float in_max, float out_min, float out_max) 
   }
   return (val - in_min) * (out_max - out_min) / divisor + out_min;
 }
-
-
-
