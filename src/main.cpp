@@ -23,13 +23,13 @@
 #define PIN_SERVO 15
 
 // PWM Channels
-#define PWM_CHANNEL_FORWARD 0
-#define PWM_CHANNEL_BACKWARD 1
-#define PWM_CHANNEL_SERVO 2
+#define PWM_CHANNEL_FORWARD LEDC_CHANNEL_2
+#define PWM_CHANNEL_BACKWARD LEDC_CHANNEL_3
+#define PWM_CHANNEL_SERVO LEDC_CHANNEL_4
 
 // MIN and MAX values for PWM
 #define PWM_FREQUENCY 50
-#define PWM_RESOLUTION 16
+#define PWM_RESOLUTION LEDC_TIMER_16_BIT
 
 // These values are determined by experiment and may differ on your system
 #define PWM_MOTOR_MIN 5000    // The value where the motor starts moving
@@ -41,7 +41,7 @@
 #define ENABLE_CAMERA
 
 
-// You can also define your wifi access via platformio.ini or environment variables
+// You can also define your wifi access in 'platformio.ini' or by setting environment variables.
 // https://docs.platformio.org/en/latest/projectconf/section_env_build.html#build-flags
 // https://docs.platformio.org/en/latest/envvars.html#envvar-PLATFORMIO_BUILD_FLAGS
 // If you do, be sure to escape the quotes (\"), e.g.: -D WIFI_SSID=\"YOUR_SSID\"
@@ -145,10 +145,6 @@ void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  // Debug
-//  Serial.println(ssid);
-//  Serial.println(password);
-
   Serial.println("Connecting to Wifi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -165,7 +161,6 @@ void setupWifi() {
 void setupTopics() {
   uint64_t mac = ESP.getEfuseMac(); //The chip ID is essentially its MAC address(length: 6 bytes).
   snprintf(id, 64, "ESP32_%04X%08X", (uint16_t) (mac >> 32u), (uint32_t) mac);
-//  snprintf(cmdvelTopic, 64, "/cmd_vel");
   snprintf(cmdvelTopic, 64, "%s/cmd_vel", id);
   snprintf(flashTopic, 64, "%s/flash", id);
   snprintf(fpsTopic, 64, "%s/fps", id);
