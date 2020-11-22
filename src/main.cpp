@@ -1,22 +1,23 @@
 #include <Arduino.h>
+#include <cmath>
 #include <WiFi.h>
 #include <IPAddress.h>
 #include <esp_camera.h>
-#include <cmath>
-#include <ESP32Ticker.h>
+#include <DateTime.h>
 #include <ros.h>
 #include <geometry_msgs/Twist.h>
-#include <sensor_msgs/Image.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
 #include <std_msgs/Float32.h>
+#include <Timer.h>
+#include <Logger.h>
+#include "ImagePublisher/ImagePublisher.h"
 
 // Include correct camera pins
 #define CAMERA_MODEL_AI_THINKER
-#include "camera_pins.h"
+#include <camera_pins.h>
 
 // PINS
-#define LED_BUILTIN 33
 #define LED_FLASH 4
 #define PIN_FORWARD 12
 #define PIN_BACKWARD 13
@@ -37,24 +38,23 @@
 #define PWM_SERVO_LEFT 2100   // 90° left
 #define PWM_SERVO_RIGHT 7800  // 90° right
 
-// Debugging defines
-#define ENABLE_CAMERA
-
 
 // You can also define your wifi access in 'platformio.ini' or by setting environment variables.
 // https://docs.platformio.org/en/latest/projectconf/section_env_build.html#build-flags
 // https://docs.platformio.org/en/latest/envvars.html#envvar-PLATFORMIO_BUILD_FLAGS
 // If you do, be sure to escape the quotes (\"), e.g.: -D WIFI_SSID=\"YOUR_SSID\"
 #ifndef WIFI_SSID
-  #define WIFI_SSID "YOUR_SSID"
+#define WIFI_SSID "YOUR_SSID"
 #endif
 #ifndef WIFI_PASS
-  #define WIFI_PASS "YOUR_PASSWORD"
+#define WIFI_PASS "YOUR_PASSWORD"
 #endif
+
+
+namespace esp32cam {
 
 const char *ssid = WIFI_SSID;
 const char *password = WIFI_PASS;
-
 
 // ROS
 IPAddress serialServer(10, 0, 1, 10);
@@ -66,17 +66,22 @@ ros::Publisher *logPub;
 ros::Publisher *streamPub;
 std_msgs::Float32 *fpsMsg;
 std_msgs::String *logMsg;
-sensor_msgs::Image *stream;
+//sensor_msgs::Image *streamMsg;
 
 // ROS topics
-char id[64];
-char cmdvelTopic[64]; // id + /cmd_vel
-char streamTopic[64]; // id + /stream
-char flashTopic[64];  // id + /flash
-char fpsTopic[64];    // id + /fps
-char logTopic[64];    // id + /log
+String chipId = "ESP32_";
+String cmdVelTopic; // chipId + /cmd_vel
+String streamTopic; // chipId + /stream
+String flashTopic;  // chipId + /flash
+String fpsTopic;    // chipId + /fps
+String logTopic;    // chipId + /log
 
-bool connected = false;
+camera_config_t cameraConfig;
+ImagePublisher *imagePublisher;
+
+// Variables
+bool wifiConnected = false;
+bool rosConnected = false;
 bool movement = false;
 float linear, angular = 0;
 
@@ -88,19 +93,19 @@ unsigned long lastCmdVelMessage = 0;
 
 // Tickers
 //#define MAX_CMD_VEL_INTERVAL 1000 // If there are no new CMD_VEL message during this interval, the robot stops
-#define FPS_PUBLISH_TIME 1          // in seconds
-#define LOOP_TIME 0.01              // Loop runs way too fast on ESP32. Running the loop every 10 ms is enough
-Ticker *fpsTicker;
-Ticker *loopTicker;
 
 // Function definitions
-void startCameraServer();
 void onCmdVel(const geometry_msgs::Twist &msg);
 void onFlash(const std_msgs::Bool &msg);
 void stop();
+
+void handleMovement();
+void checkConnection();
+
+void publishImage();
 void publishFps();
 void publishLog(const char *format, ...);
-void _loop();
+
 float fmap(float val, float in_min, float in_max, float out_min, float out_max);
 
 
@@ -145,127 +150,91 @@ void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  Serial.println("Connecting to Wifi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+  chipId.concat(WiFi.macAddress());
+  chipId.replace(":", "");
+  Serial.printf("ChipId: %s\n", chipId.c_str());
 
-  Serial.println("\nWifi connected");
-  Serial.print("SSID: ");
-  Serial.println(WiFi.SSID());
-  Serial.print("IP:   http://");
-  Serial.println(WiFi.localIP());
+  DateTimeClass time(BUILD_TIME);
+  Serial.printf("Build:  %s\n", time.toISOString().c_str());
+}
+
+void setupCamera() {
+  cameraConfig.ledc_channel = LEDC_CHANNEL_0;
+  cameraConfig.ledc_timer = LEDC_TIMER_0;
+  cameraConfig.pin_d0 = Y2_GPIO_NUM;
+  cameraConfig.pin_d1 = Y3_GPIO_NUM;
+  cameraConfig.pin_d2 = Y4_GPIO_NUM;
+  cameraConfig.pin_d3 = Y5_GPIO_NUM;
+  cameraConfig.pin_d4 = Y6_GPIO_NUM;
+  cameraConfig.pin_d5 = Y7_GPIO_NUM;
+  cameraConfig.pin_d6 = Y8_GPIO_NUM;
+  cameraConfig.pin_d7 = Y9_GPIO_NUM;
+  cameraConfig.pin_xclk = XCLK_GPIO_NUM;
+  cameraConfig.pin_pclk = PCLK_GPIO_NUM;
+  cameraConfig.pin_vsync = VSYNC_GPIO_NUM;
+  cameraConfig.pin_href = HREF_GPIO_NUM;
+  cameraConfig.pin_sscb_sda = SIOD_GPIO_NUM;
+  cameraConfig.pin_sscb_scl = SIOC_GPIO_NUM;
+  cameraConfig.pin_pwdn = PWDN_GPIO_NUM;
+  cameraConfig.pin_reset = RESET_GPIO_NUM;
+  cameraConfig.xclk_freq_hz = 20000000;
+  cameraConfig.pixel_format = PIXFORMAT_JPEG;
+
+  //init with high specs to pre-allocate larger buffers
+  if (psramFound()) {
+    cameraConfig.frame_size = FRAMESIZE_UXGA;
+    cameraConfig.jpeg_quality = 10;
+    cameraConfig.fb_count = 2;
+  } else {
+    cameraConfig.frame_size = FRAMESIZE_SVGA;
+    cameraConfig.jpeg_quality = 12;
+    cameraConfig.fb_count = 1;
+  }
 }
 
 void setupTopics() {
-  uint64_t mac = ESP.getEfuseMac(); //The chip ID is essentially its MAC address(length: 6 bytes).
-  snprintf(id, 64, "ESP32_%04X%08X", (uint16_t) (mac >> 32u), (uint32_t) mac);
-  snprintf(cmdvelTopic, 64, "%s/cmd_vel", id);
-  snprintf(flashTopic, 64, "%s/flash", id);
-  snprintf(fpsTopic, 64, "%s/fps", id);
-  snprintf(logTopic, 64, "%s/log", id);
-  snprintf(streamTopic, 64, "%s/stream", id);
-  Serial.print("ID:   ");
-  Serial.println(id);
+
+  cmdVelTopic = chipId + "/cmd_vel";
+  flashTopic = chipId + "/flash";
+  fpsTopic = chipId + "/fps";
+  logTopic = chipId + "/log";
+  streamTopic = chipId + "/stream";
 }
 
 void setupRos() {
-  Serial.print("Connecting to ROS serial server @ ");
-  Serial.println(serialServer.toString());
+  Serial.printf("ROS serial server: %s\n", serialServer.toString().c_str());
 
-  // Connect to rosserial socket server and init node. (Using default port of 11411)
+  // Connect to ros-serial socket server and init node. (Using default port of 11411)
   node = new ros::NodeHandle();
   node->getHardware()->setConnection(serialServer);
   node->initNode();
 
   // Subscribers
-  cmdvelSub = new ros::Subscriber<geometry_msgs::Twist>(cmdvelTopic, &onCmdVel);
+  cmdvelSub = new ros::Subscriber<geometry_msgs::Twist>(cmdVelTopic.c_str(), &onCmdVel);
   node->subscribe(*cmdvelSub);
 
-  flashSub = new ros::Subscriber<std_msgs::Bool>(flashTopic, &onFlash);
+  flashSub = new ros::Subscriber<std_msgs::Bool>(flashTopic.c_str(), &onFlash);
   node->subscribe(*flashSub);
 
   // Publishers
   fpsMsg = new std_msgs::Float32();
-  fpsPub = new ros::Publisher(fpsTopic, fpsMsg);
+  fpsPub = new ros::Publisher(fpsTopic.c_str(), fpsMsg);
   node->advertise(*fpsPub);
 
   logMsg = new std_msgs::String();
-  logPub = new ros::Publisher(logTopic, logMsg);
+  logPub = new ros::Publisher(logTopic.c_str(), logMsg);
   node->advertise(*logPub);
 
-//  stream = new sensor_msgs::Image();
-//  streamPub = new ros::Publisher(streamTopic, stream);
-//  node->advertise(*streamPub);
-}
-
-void setupCamera() {
-
-#ifdef ENABLE_CAMERA
-
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-
-  //init with high specs to pre-allocate larger buffers
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-  } else {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-  }
-
-
-  // camera init
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    delay(500);
-    ESP.restart();
-    return;
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  //initial sensors are flipped vertically and colors are a bit saturated
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);//flip it back
-    s->set_brightness(s, 1);//up the blightness just a bit
-    s->set_saturation(s, -2);//lower the saturation
-  }
-  //drop down frame size for higher initial frame rate
-  s->set_framesize(s, FRAMESIZE_QVGA);
-
-#endif
+  imagePublisher = new ImagePublisher();
+  imagePublisher->init(*node, streamTopic.c_str(), cameraConfig);
 }
 
 void setupTickers() {
-  fpsTicker = new Ticker();
-  fpsTicker->attach(FPS_PUBLISH_TIME, publishFps);
-
-  loopTicker = new Ticker();
-  loopTicker->attach(LOOP_TIME, _loop);
+  Timer.setInterval(&Logger, 5, -1, -10);
+  Timer.setInterval(checkConnection, 1000);
+  Timer.setInterval(handleMovement, 10);
+  Timer.setInterval(publishFps, 1000);
+  Timer.setInterval(publishImage, 33);
 }
 
 // ROS callbacks
@@ -286,24 +255,8 @@ void onCmdVel(const geometry_msgs::Twist &msg) {
   movement = true;
 }
 
-
-// Loop functions (run every frame)
+// Robot control
 // -------------------------------------------------------------------
-
-bool rosConnected() {
-  // If value changes, notify via LED and console.
-  bool conn = node->connected();
-  if (connected != conn) {
-    connected = conn;
-    if (!connected)
-      stop();
-
-    digitalWrite(LED_BUILTIN, !connected); // false -> on, true -> off
-    publishLog(connected ? "ROS connected" : "ROS disconnected");
-  }
-  return connected;
-}
-
 // Stops in next frame
 void stop() {
   linear = 0;
@@ -340,23 +293,20 @@ void handleMovement() {
   movement = false;
 }
 
-void measureFramerate() {
-  auto now = millis();
-  auto duration = now - lastFrameTime;
-  lastFrameTime = now;
-
-  // Calculate Exponential moving average of frame time
-  // https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average
-  frameDuration = duration * AVERAGE_ALPHA + (frameDuration * (1 - AVERAGE_ALPHA));
-}
-
-// Publish functions
+// ROS
 // -------------------------------------------------------------------
+
+void publishImage() {
+  if (rosConnected) {
+    imagePublisher->publish();
+  }
+}
 
 void publishFps() {
   if (frameDuration > 0) {
     fpsMsg->data = 1000.0f / frameDuration;
     fpsPub->publish(fpsMsg);
+//    Serial.printf("%f\n", fpsMsg->data);
   }
 }
 
@@ -371,6 +321,66 @@ void publishLog(const char *format, ...) {
   Serial.printf("%s\n", buffer);
 }
 
+void measureFramerate() {
+  auto now = millis();
+  auto duration = now - lastFrameTime;
+  lastFrameTime = now;
+
+  // Calculate Exponential moving average of frame time
+  // https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average
+  frameDuration = duration * AVERAGE_ALPHA + (frameDuration * (1 - AVERAGE_ALPHA));
+}
+
+// Check connection functions
+// -------------------------------------------------------------------
+
+bool checkWifi() {
+  if (wifiConnected) {
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiConnected = false;
+      stop();
+
+      Serial.println("WiFi disconnected");
+    }
+  } else {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+
+      Serial.println("WiFi connected");
+      Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
+      Serial.printf("IP:   %s\n", WiFi.localIP().toString().c_str());
+    }
+  }
+  return wifiConnected;
+}
+
+bool checkROS() {
+
+  if (rosConnected) {
+    if (!node->connected()) {
+      rosConnected = false;
+      stop();
+
+      Serial.println("ROS disconnected");
+      digitalWrite(LED_BUILTIN, !rosConnected); // false -> on, true -> off
+    }
+  } else {
+    if (node->connected()) {
+      rosConnected = true;
+
+      Serial.println("ROS connected");
+      digitalWrite(LED_BUILTIN, !rosConnected); // false -> on, true -> off
+    }
+  }
+  return rosConnected;
+}
+
+void checkConnection() {
+  if (checkWifi()) {
+    checkROS();
+  }
+}
+
 // Main functions
 // -------------------------------------------------------------------
 
@@ -381,30 +391,29 @@ void setup() {
   setupCamera();
   setupTopics();
   setupRos();
-
-#ifdef ENABLE_CAMERA
-  startCameraServer();
-#endif
   setupTickers();
 }
 
 // Note: regular loop function gets called way too fast, so we run our own loop here
-void _loop() {
+void loop() {
   measureFramerate();
   node->spinOnce();
-  rosConnected();
-  handleMovement();
+  Timer.loop();
 }
 
-void loop() { }
 
 // Helper functions
 // -------------------------------------------------------------------
 
 float fmap(float val, float in_min, float in_max, float out_min, float out_max) {
-  float divisor = (in_max - in_min);
-  if (divisor == 0) {
-    return -1; //AVR returns -1, SAM returns 0
-  }
-  return (val - in_min) * (out_max - out_min) / divisor + out_min;
+  return (val - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+}
+
+void setup() {
+  esp32cam::setup();
+}
+
+void loop() {
+  esp32cam::loop();
 }

@@ -539,7 +539,9 @@ public:
     }
     else
     {
-      logerror("Message from device dropped: message larger than buffer.");
+      Serial.println("Message from device dropped: message larger than buffer.");
+      // Problem: If the message is already too long, sending new data will crash the system.
+      // logerror("Message from device dropped: message larger than buffer.");
       return -1;
     }
   }
