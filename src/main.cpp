@@ -88,8 +88,8 @@ float linear, angular = 0;
 // Timing
 #define AVERAGE_ALPHA 0.7f
 float frameDuration = 0;
-unsigned long lastFrameTime = 0;
-unsigned long lastCmdVelMessage = 0;
+uint32_t lastFrameTime = 0;
+uint32_t lastCmdVelMessage = 0;
 
 // Tickers
 //#define MAX_CMD_VEL_INTERVAL 1000 // If there are no new CMD_VEL message during this interval, the robot stops
@@ -322,8 +322,8 @@ void publishLog(const char *format, ...) {
 }
 
 void measureFramerate() {
-  auto now = millis();
-  auto duration = now - lastFrameTime;
+  uint32_t now = millis();
+  uint32_t duration = now - lastFrameTime;
   lastFrameTime = now;
 
   // Calculate Exponential moving average of frame time

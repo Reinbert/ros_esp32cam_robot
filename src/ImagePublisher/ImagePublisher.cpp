@@ -1,4 +1,5 @@
 #include "ImagePublisher.h"
+#include <cmath>
 #include <img_converters.h>
 #include <ros.h>
 #include <sensor_msgs/CompressedImage.h>
@@ -35,6 +36,9 @@ void ImagePublisher::publish() {
 
   int32_t status = captureImage();
   if (status == ESP_OK) {
+
+    jpgBufferLength = fmin(jpgBufferLength, 1023+1023-1063);
+
     image->data = jpgBuffer;
     image->data_length = jpgBufferLength;
     publisher->publish(image);
@@ -96,7 +100,7 @@ esp_err_t ImagePublisher::captureImage() {
   }
 
   if (status == ESP_OK) {
-//    Serial.printf("buffer length: %d\n", jpgBufferLength);
+//    Serial.printf("format: %d, width: %d, height: %d, length: %d\n", buffer->format, buffer->width, buffer->height, buffer->len);
   }
   return status;
 }
